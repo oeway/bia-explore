@@ -1,13 +1,13 @@
 """FastAPI server for Daphnia segmentation viewer."""
 import io
-import json
-import base64
 import numpy as np
 from pathlib import Path
 from PIL import Image
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, Response
 from scipy import ndimage
+from scipy.ndimage import gaussian_filter
+import cv2
 
 app = FastAPI(title="Daphnia Segmentation Viewer")
 
@@ -21,163 +21,157 @@ RAW_16 = np.array(Image.open(IMG_PATH))
 
 
 def to_uint8(arr):
-    """Normalize array to 0-255 uint8."""
     mn, mx = arr.min(), arr.max()
     if mx == mn:
         return np.zeros_like(arr, dtype=np.uint8)
     return ((arr - mn) / (mx - mn) * 255).astype(np.uint8)
 
 
-def arr_to_png_bytes(arr, colormap=None):
-    """Convert numpy array to PNG bytes."""
+def arr_to_png_bytes(arr):
     if arr.dtype != np.uint8:
         arr = to_uint8(arr)
-    if colormap == "mask_overlay":
-        # arr is expected to be an RGB array already
+    if len(arr.shape) == 3:
         img = Image.fromarray(arr)
-    elif len(arr.shape) == 2:
-        img = Image.fromarray(arr, mode="L")
     else:
-        img = Image.fromarray(arr)
+        img = Image.fromarray(arr, mode="L")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
 def get_well_mask(img):
-    """Detect the circular well to restrict analysis."""
-    # The well is the bright circular area; outside is dark
-    threshold = np.percentile(img, 30)
-    bright = img > threshold
-    # Fill holes and find largest connected component
-    bright = ndimage.binary_fill_holes(bright)
-    labeled, n = ndimage.label(bright)
-    if n == 0:
+    """Detect the circular well by fitting a circle to the bright region."""
+    thresh = np.percentile(img, 30)
+    bright = (img > thresh).astype(np.uint8)
+    bright = ndimage.binary_fill_holes(bright).astype(np.uint8)
+    contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         return np.ones_like(img, dtype=bool)
-    sizes = ndimage.sum(bright, labeled, range(1, n + 1))
-    largest = np.argmax(sizes) + 1
-    well = labeled == largest
-    # Erode slightly to avoid well border
-    well = ndimage.binary_erosion(well, iterations=10)
+    c = max(contours, key=cv2.contourArea)
+    (cx, cy), radius = cv2.minEnclosingCircle(c)
+    y, x = np.mgrid[0:img.shape[0], 0:img.shape[1]]
+    well = ((x - cx) ** 2 + (y - cy) ** 2) < (radius - 30) ** 2
     return well
 
 
-def segment_body(img, well_mask, threshold_pct=35):
-    """Segment the Daphnia body using thresholding within the well."""
-    # Work within well only
-    well_pixels = img[well_mask]
-    threshold = np.percentile(well_pixels, threshold_pct)
-    body = (img < threshold) & well_mask
-    # Morphological cleanup
-    body = ndimage.binary_fill_holes(body)
-    body = ndimage.binary_opening(body, iterations=3)
-    body = ndimage.binary_closing(body, iterations=5)
-    body = ndimage.binary_fill_holes(body)
+def segment_body(img, well, body_ratio_thresh=0.85):
+    """Segment Daphnia body using local contrast ratio within the well."""
+    local_bg = gaussian_filter(img.astype(float), sigma=50)
+    ratio = img.astype(float) / (local_bg + 1)
+    body_raw = (ratio < body_ratio_thresh) & well
+    body_raw = ndimage.binary_closing(body_raw, iterations=5)
+    body_raw = ndimage.binary_opening(body_raw, iterations=2)
     # Keep largest connected component
-    labeled, n = ndimage.label(body)
-    if n == 0:
-        return body
-    sizes = ndimage.sum(body, labeled, range(1, n + 1))
-    largest = np.argmax(sizes) + 1
-    body = labeled == largest
+    lab, n = ndimage.label(body_raw)
+    if n > 0:
+        sz = [ndimage.sum(body_raw, lab, i) for i in range(1, n + 1)]
+        body_raw = lab == (np.argmax(sz) + 1)
+    body = ndimage.binary_fill_holes(body_raw)
+    body = ndimage.binary_closing(body, iterations=8)
+    body = ndimage.binary_opening(body, iterations=3)
+    body = ndimage.binary_fill_holes(body)
+    body = body & well
+    # Ensure single connected component
+    lab, n = ndimage.label(body)
+    if n > 1:
+        sz = [ndimage.sum(body, lab, i) for i in range(1, n + 1)]
+        body = lab == (np.argmax(sz) + 1)
     return body
 
 
-def segment_eye(img, body_mask, dark_pct=2):
-    """Segment the eye — the darkest compact region within the body."""
-    body_pixels = img[body_mask]
-    threshold = np.percentile(body_pixels, dark_pct)
-    eye = (img < threshold) & body_mask
-    # Cleanup: close to merge nearby dark pixels, then keep compact component
-    eye = ndimage.binary_closing(eye, iterations=3)
-    eye = ndimage.binary_fill_holes(eye)
-    labeled, n = ndimage.label(eye)
+def segment_eye(img, body, eye_pct=4):
+    """Segment the eye — the most circular dark region within the body."""
+    if body.sum() == 0:
+        return np.zeros_like(img, dtype=bool)
+    body_pixels = img[body]
+    eye_thresh = np.percentile(body_pixels, eye_pct)
+    eye_mask = (img < eye_thresh) & body
+    eye_mask = ndimage.binary_closing(eye_mask, iterations=4)
+    eye_mask = ndimage.binary_fill_holes(eye_mask)
+    lab, n = ndimage.label(eye_mask)
     if n == 0:
-        return eye
-    # Pick the most compact (roundest) component of reasonable size
-    best_label = 1
-    best_score = 0
+        return np.zeros_like(img, dtype=bool)
+    # Score by circularity * sqrt(area) / intensity
+    best_label, best_score = 1, 0
     for i in range(1, n + 1):
-        comp = labeled == i
+        comp = lab == i
         area = comp.sum()
-        if area < 20:
+        if area < 50:
             continue
-        # Compactness: area / (perimeter^2) — approximate perimeter by erosion
-        eroded = ndimage.binary_erosion(comp)
-        perimeter = (comp & ~eroded).sum()
-        if perimeter == 0:
+        cc, _ = cv2.findContours(comp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cc:
             continue
-        compactness = area / (perimeter ** 2)
-        # Prefer darker average intensity
-        mean_intensity = img[comp].mean()
-        score = compactness * area / (mean_intensity + 1)
+        perim = cv2.arcLength(cc[0], True)
+        if perim == 0:
+            continue
+        circ = 4 * np.pi * area / (perim ** 2)
+        score = circ * np.sqrt(area) / (img[comp].mean() + 1)
         if score > best_score:
             best_score = score
             best_label = i
-    eye = labeled == best_label
-    eye = ndimage.binary_fill_holes(eye)
-    return eye
+    eye = ndimage.binary_fill_holes(lab == best_label)
+    # Dilate slightly to capture full eye extent
+    eye = ndimage.binary_dilation(eye, iterations=2)
+    return eye & body
 
 
-def segment_brain(img, body_mask, eye_mask, brain_intensity_pct=15):
-    """Segment the brain — darker region near the eye, in the head."""
-    # Find eye centroid to locate head region
-    eye_coords = np.argwhere(eye_mask)
+def segment_brain(img, body, eye, brain_pct=18):
+    """Segment the brain — darker region near the eye in the head."""
+    eye_coords = np.argwhere(eye)
     if len(eye_coords) == 0:
         return np.zeros_like(img, dtype=bool)
-    eye_center = eye_coords.mean(axis=0)
-
-    # Create a search region around the eye (head area)
+    ey, ex = eye_coords.mean(axis=0)
     y, x = np.mgrid[0:img.shape[0], 0:img.shape[1]]
-    dist_from_eye = np.sqrt((y - eye_center[0]) ** 2 + (x - eye_center[1]) ** 2)
-    eye_radius = max(np.sqrt(eye_mask.sum() / np.pi), 10)
-    head_region = (dist_from_eye < eye_radius * 6) & body_mask & ~eye_mask
-
+    dist = np.sqrt((y - ey) ** 2 + (x - ex) ** 2)
+    eye_r = max(np.sqrt(eye.sum() / np.pi), 15)
+    # Tighter search radius: brain should be close to the eye
+    head_region = (dist < eye_r * 4) & body & ~eye
     if head_region.sum() == 0:
         return np.zeros_like(img, dtype=bool)
-
-    # Brain: moderately dark region in the head area
     head_pixels = img[head_region]
-    threshold = np.percentile(head_pixels, brain_intensity_pct)
-    brain = (img < threshold) & head_region
+    brain_thresh = np.percentile(head_pixels, brain_pct)
+    brain = (img < brain_thresh) & head_region
     brain = ndimage.binary_closing(brain, iterations=3)
     brain = ndimage.binary_fill_holes(brain)
     brain = ndimage.binary_opening(brain, iterations=2)
-    # Keep largest component
-    labeled, n = ndimage.label(brain)
-    if n == 0:
-        return brain
-    sizes = ndimage.sum(brain, labeled, range(1, n + 1))
-    largest = np.argmax(sizes) + 1
-    brain = labeled == largest
-    return brain
+    lab, n = ndimage.label(brain)
+    if n > 0:
+        sz = [ndimage.sum(brain, lab, i) for i in range(1, n + 1)]
+        brain = lab == (np.argmax(sz) + 1)
+    # Cap brain size: should not exceed ~5x eye area
+    max_brain = max(eye.sum() * 5, 2000)
+    if brain.sum() > max_brain:
+        # Erode to reduce size
+        while brain.sum() > max_brain:
+            brain = ndimage.binary_erosion(brain)
+            if brain.sum() == 0:
+                break
+    return brain & body & ~eye
 
 
-def create_overlay(img, body_mask, eye_mask, brain_mask, alpha=0.4):
-    """Create RGB overlay of masks on the original image."""
+def create_overlay(img, body, eye, brain):
     img8 = to_uint8(img)
     rgb = np.stack([img8, img8, img8], axis=-1).astype(np.float32)
-    # Body: green outline
-    body_border = body_mask & ~ndimage.binary_erosion(body_mask, iterations=2)
-    rgb[body_border] = rgb[body_border] * (1 - alpha) + np.array([0, 255, 0]) * alpha
+    # Body: green border
+    border = body & ~ndimage.binary_erosion(body, iterations=2)
+    rgb[border] = rgb[border] * 0.4 + np.array([0, 255, 0]) * 0.6
     # Eye: red fill
-    rgb[eye_mask] = rgb[eye_mask] * (1 - 0.5) + np.array([255, 50, 50]) * 0.5
+    rgb[eye] = rgb[eye] * 0.4 + np.array([255, 50, 50]) * 0.6
     # Brain: blue fill
-    rgb[brain_mask] = rgb[brain_mask] * (1 - 0.5) + np.array([50, 100, 255]) * 0.5
+    rgb[brain] = rgb[brain] * 0.4 + np.array([50, 100, 255]) * 0.6
     return rgb.astype(np.uint8)
 
 
-# Cache for current segmentation results
 cache = {}
 
 
-def run_segmentation(body_thresh=35, eye_dark_pct=2, brain_pct=15):
-    key = (body_thresh, eye_dark_pct, brain_pct)
+def run_segmentation(body_ratio=0.85, eye_pct=4, brain_pct=18):
+    key = (body_ratio, eye_pct, brain_pct)
     if key in cache:
         return cache[key]
     well = get_well_mask(RAW_16)
-    body = segment_body(RAW_16, well, body_thresh)
-    eye = segment_eye(RAW_16, body, eye_dark_pct)
+    body = segment_body(RAW_16, well, body_ratio)
+    eye = segment_eye(RAW_16, body, eye_pct)
     brain = segment_brain(RAW_16, body, eye, brain_pct)
     overlay = create_overlay(RAW_16, body, eye, brain)
     result = {"body": body, "eye": eye, "brain": brain, "overlay": overlay, "well": well}
@@ -192,22 +186,22 @@ def get_original():
 
 @app.get("/api/segment.png")
 def get_segmentation(
-    body_thresh: float = Query(35, ge=5, le=80),
-    eye_dark_pct: float = Query(2, ge=0.5, le=15),
-    brain_pct: float = Query(15, ge=3, le=40),
+    body_ratio: float = Query(0.85, ge=0.5, le=0.98),
+    eye_pct: float = Query(4, ge=1, le=15),
+    brain_pct: float = Query(18, ge=3, le=40),
 ):
-    result = run_segmentation(body_thresh, eye_dark_pct, brain_pct)
-    return Response(content=arr_to_png_bytes(result["overlay"], colormap="mask_overlay"), media_type="image/png")
+    result = run_segmentation(body_ratio, eye_pct, brain_pct)
+    return Response(content=arr_to_png_bytes(result["overlay"]), media_type="image/png")
 
 
 @app.get("/api/mask/{name}.png")
 def get_mask(
     name: str,
-    body_thresh: float = Query(35),
-    eye_dark_pct: float = Query(2),
-    brain_pct: float = Query(15),
+    body_ratio: float = Query(0.85),
+    eye_pct: float = Query(4),
+    brain_pct: float = Query(18),
 ):
-    result = run_segmentation(body_thresh, eye_dark_pct, brain_pct)
+    result = run_segmentation(body_ratio, eye_pct, brain_pct)
     if name not in result:
         return Response(content=b"Not found", status_code=404)
     mask = result[name]
@@ -218,11 +212,11 @@ def get_mask(
 
 @app.get("/api/stats")
 def get_stats(
-    body_thresh: float = Query(35),
-    eye_dark_pct: float = Query(2),
-    brain_pct: float = Query(15),
+    body_ratio: float = Query(0.85),
+    eye_pct: float = Query(4),
+    brain_pct: float = Query(18),
 ):
-    result = run_segmentation(body_thresh, eye_dark_pct, brain_pct)
+    result = run_segmentation(body_ratio, eye_pct, brain_pct)
     return {
         "body_area_px": int(result["body"].sum()),
         "eye_area_px": int(result["eye"].sum()),
@@ -249,28 +243,27 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .header h1 { font-size: 18px; color: #e94560; }
 .header .status { font-size: 13px; color: #888; margin-left: auto; }
 .main { display: flex; height: calc(100vh - 49px); }
-.sidebar { width: 300px; background: #16213e; padding: 16px; overflow-y: auto; border-right: 1px solid #0f3460; flex-shrink: 0; }
+.sidebar { width: 320px; background: #16213e; padding: 16px; overflow-y: auto; border-right: 1px solid #0f3460; flex-shrink: 0; }
 .sidebar h3 { font-size: 13px; text-transform: uppercase; color: #e94560; margin-bottom: 10px; letter-spacing: 1px; }
 .control { margin-bottom: 16px; }
 .control label { display: block; font-size: 12px; color: #aaa; margin-bottom: 4px; }
 .control input[type=range] { width: 100%; accent-color: #e94560; }
 .control .value { font-size: 12px; color: #e94560; float: right; }
-.btn { background: #e94560; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; width: 100%; margin-bottom: 8px; transition: background 0.2s; }
+.control .desc { font-size: 10px; color: #666; margin-top: 2px; clear: both; }
+.btn { background: #e94560; color: white; border: none; padding: 10px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; width: 100%; margin-bottom: 8px; transition: background 0.2s; }
 .btn:hover { background: #c73652; }
 .btn.secondary { background: #0f3460; }
 .btn.secondary:hover { background: #1a4a8a; }
-.btn.active { outline: 2px solid #e94560; outline-offset: 2px; }
 .stats { background: #0f3460; border-radius: 6px; padding: 12px; margin-top: 12px; font-size: 12px; }
 .stats .row { display: flex; justify-content: space-between; margin-bottom: 4px; }
 .stats .label { color: #888; }
 .stats .ok { color: #4caf50; }
 .stats .bad { color: #f44336; }
-.viewer { flex: 1; position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; }
-.viewer canvas { max-width: 100%; max-height: 100%; }
-.compare-container { position: relative; display: inline-block; }
+.viewer { flex: 1; position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; background: #111; }
+.compare-container { position: relative; display: inline-block; user-select: none; }
 .compare-container img { display: block; max-width: 100%; max-height: calc(100vh - 49px); }
 .compare-slider { position: absolute; top: 0; bottom: 0; width: 3px; background: #e94560; cursor: ew-resize; z-index: 10; }
-.compare-slider::after { content: ''; position: absolute; top: 50%; left: -10px; width: 23px; height: 40px; background: #e94560; border-radius: 4px; transform: translateY(-50%); }
+.compare-slider::after { content: '\\2194'; position: absolute; top: 50%; left: -12px; width: 27px; height: 27px; background: #e94560; border-radius: 50%; transform: translateY(-50%); display: flex; align-items: center; justify-content: center; font-size: 14px; color: white; line-height: 27px; text-align: center; }
 .compare-right { position: absolute; top: 0; right: 0; bottom: 0; overflow: hidden; }
 .compare-right img { position: absolute; top: 0; right: 0; max-height: calc(100vh - 49px); }
 .legend { position: absolute; bottom: 16px; right: 16px; background: rgba(22,33,62,0.9); padding: 10px 14px; border-radius: 6px; font-size: 12px; }
@@ -291,32 +284,35 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   <div class="sidebar">
     <h3>View Mode</h3>
     <div class="mode-tabs">
-      <button class="mode-tab active" onclick="setMode('compare')" id="tab-compare">Compare</button>
       <button class="mode-tab" onclick="setMode('original')" id="tab-original">Original</button>
-      <button class="mode-tab" onclick="setMode('overlay')" id="tab-overlay">Overlay</button>
+      <button class="mode-tab active" onclick="setMode('overlay')" id="tab-overlay">Overlay</button>
+      <button class="mode-tab" onclick="setMode('compare')" id="tab-compare">Compare</button>
     </div>
 
-    <h3>Parameters</h3>
+    <h3>Segmentation Parameters</h3>
     <div class="control">
-      <label>Body threshold percentile <span class="value" id="val-body">35</span></label>
-      <input type="range" id="param-body" min="5" max="80" value="35" step="1">
+      <label>Body contrast ratio <span class="value" id="val-body">0.85</span></label>
+      <input type="range" id="param-body" min="0.5" max="0.98" value="0.85" step="0.01">
+      <div class="desc">Lower = tighter body mask (only darkest regions)</div>
     </div>
     <div class="control">
-      <label>Eye dark percentile <span class="value" id="val-eye">2</span></label>
-      <input type="range" id="param-eye" min="0.5" max="15" value="2" step="0.5">
+      <label>Eye dark percentile <span class="value" id="val-eye">4</span></label>
+      <input type="range" id="param-eye" min="1" max="15" value="4" step="0.5">
+      <div class="desc">Lower = stricter (only darkest pixels as eye)</div>
     </div>
     <div class="control">
-      <label>Brain intensity percentile <span class="value" id="val-brain">15</span></label>
-      <input type="range" id="param-brain" min="3" max="40" value="15" step="1">
+      <label>Brain intensity percentile <span class="value" id="val-brain">18</span></label>
+      <input type="range" id="param-brain" min="3" max="40" value="18" step="1">
+      <div class="desc">Higher = larger brain region</div>
     </div>
 
     <button class="btn" onclick="runSegmentation()">Run Segmentation</button>
     <button class="btn secondary" onclick="resetParams()">Reset Defaults</button>
 
     <h3 style="margin-top:16px">Individual Masks</h3>
-    <button class="btn secondary" onclick="showMask('body')">Show Body Mask</button>
-    <button class="btn secondary" onclick="showMask('eye')">Show Eye Mask</button>
-    <button class="btn secondary" onclick="showMask('brain')">Show Brain Mask</button>
+    <button class="btn secondary" onclick="showMask('body')">Body Mask</button>
+    <button class="btn secondary" onclick="showMask('eye')">Eye Mask</button>
+    <button class="btn secondary" onclick="showMask('brain')">Brain Mask</button>
 
     <div class="stats" id="stats">
       <div class="row"><span class="label">Click "Run Segmentation" to start</span></div>
@@ -342,24 +338,23 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 </div>
 
 <script>
-let mode = 'compare';
+const BASE = '';
+let mode = 'overlay';
 let overlayUrl = null;
-let currentParams = {};
 
 function getParams() {
   return {
-    body_thresh: document.getElementById('param-body').value,
-    eye_dark_pct: document.getElementById('param-eye').value,
+    body_ratio: document.getElementById('param-body').value,
+    eye_pct: document.getElementById('param-eye').value,
     brain_pct: document.getElementById('param-brain').value
   };
 }
 
 function paramString() {
   const p = getParams();
-  return `body_thresh=${p.body_thresh}&eye_dark_pct=${p.eye_dark_pct}&brain_pct=${p.brain_pct}`;
+  return `body_ratio=${p.body_ratio}&eye_pct=${p.eye_pct}&brain_pct=${p.brain_pct}`;
 }
 
-// Update value displays
 ['body','eye','brain'].forEach(name => {
   const el = document.getElementById('param-'+name);
   el.addEventListener('input', () => {
@@ -383,14 +378,13 @@ function render() {
   const single = document.getElementById('singleImg');
   const legend = document.getElementById('legend');
   const loading = document.getElementById('loading');
-
   compare.style.display = 'none';
   single.style.display = 'none';
   legend.style.display = 'none';
 
   if (mode === 'original') {
     single.style.display = 'block';
-    single.src = '/api/original.png';
+    single.src = 'api/original.png';
     loading.style.display = 'none';
   } else if (mode === 'overlay' && overlayUrl) {
     single.style.display = 'block';
@@ -399,26 +393,26 @@ function render() {
     loading.style.display = 'none';
   } else if (mode === 'compare' && overlayUrl) {
     compare.style.display = 'block';
-    document.getElementById('imgLeft').src = '/api/original.png';
-    document.getElementById('imgRight').src = overlayUrl;
+    const leftImg = document.getElementById('imgLeft');
+    const rightImg = document.getElementById('imgRight');
+    leftImg.src = 'api/original.png';
+    rightImg.src = overlayUrl;
     legend.style.display = 'block';
     loading.style.display = 'none';
-    requestAnimationFrame(() => initSlider());
-  } else if (mode === 'compare' || mode === 'overlay') {
+    leftImg.onload = () => initSlider();
+  } else {
     loading.style.display = 'block';
-    loading.textContent = 'Run segmentation first';
+    loading.textContent = overlayUrl ? 'Loading...' : 'Click "Run Segmentation" to start';
   }
 }
 
 function showMask(name) {
+  document.getElementById('compareContainer').style.display = 'none';
   const single = document.getElementById('singleImg');
-  const compare = document.getElementById('compareContainer');
-  compare.style.display = 'none';
   single.style.display = 'block';
-  single.src = `/api/mask/${name}.png?${paramString()}`;
+  single.src = `api/mask/${name}.png?${paramString()}`;
   document.getElementById('loading').style.display = 'none';
   document.getElementById('legend').style.display = 'none';
-  // Deselect mode tabs
   document.querySelectorAll('.mode-tab').forEach(t => t.classList.remove('active'));
 }
 
@@ -426,30 +420,28 @@ async function runSegmentation() {
   setStatus('Running segmentation...');
   document.getElementById('loading').style.display = 'block';
   document.getElementById('loading').textContent = 'Segmenting...';
-
   const ps = paramString();
-  overlayUrl = `/api/segment.png?${ps}`;
-
-  // Preload the overlay image
+  overlayUrl = `api/segment.png?${ps}`;
   const img = new window.Image();
   img.onload = async () => {
     setStatus('Done');
     render();
-    // Fetch stats
-    const resp = await fetch(`/api/stats?${ps}`);
-    const data = await resp.json();
-    updateStats(data);
+    try {
+      const resp = await fetch(`api/stats?${ps}`);
+      const data = await resp.json();
+      updateStats(data);
+    } catch(e) { console.error(e); }
   };
-  img.onerror = () => setStatus('Error loading segmentation');
+  img.onerror = () => { setStatus('Error'); document.getElementById('loading').textContent = 'Error loading segmentation'; };
   img.src = overlayUrl;
 }
 
 function updateStats(data) {
-  const el = document.getElementById('stats');
-  el.innerHTML = `
+  document.getElementById('stats').innerHTML = `
     <div class="row"><span class="label">Body area</span><span>${data.body_area_px.toLocaleString()} px</span></div>
     <div class="row"><span class="label">Eye area</span><span>${data.eye_area_px.toLocaleString()} px</span></div>
     <div class="row"><span class="label">Brain area</span><span>${data.brain_area_px.toLocaleString()} px</span></div>
+    <hr style="border-color:#1a1a2e;margin:6px 0">
     <div class="row"><span class="label">Eye in body?</span><span class="${data.eye_in_body?'ok':'bad'}">${data.eye_in_body?'Yes':'No'}</span></div>
     <div class="row"><span class="label">Brain in body?</span><span class="${data.brain_in_body?'ok':'bad'}">${data.brain_in_body?'Yes':'No'}</span></div>
     <div class="row"><span class="label">Eye-brain overlap</span><span class="${data.eye_brain_overlap===0?'ok':'bad'}">${data.eye_brain_overlap} px</span></div>
@@ -457,58 +449,50 @@ function updateStats(data) {
 }
 
 function resetParams() {
-  document.getElementById('param-body').value = 35;
-  document.getElementById('param-eye').value = 2;
-  document.getElementById('param-brain').value = 15;
-  ['body','eye','brain'].forEach(name => {
-    document.getElementById('val-'+name).textContent = document.getElementById('param-'+name).value;
-  });
+  document.getElementById('param-body').value = 0.85;
+  document.getElementById('param-eye').value = 4;
+  document.getElementById('param-brain').value = 18;
+  document.getElementById('val-body').textContent = '0.85';
+  document.getElementById('val-eye').textContent = '4';
+  document.getElementById('val-brain').textContent = '18';
 }
 
-// Slider for compare mode
 function initSlider() {
   const container = document.getElementById('compareContainer');
   const slider = document.getElementById('slider');
   const clipRight = document.getElementById('clipRight');
   const w = container.offsetWidth;
-
   let pos = w / 2;
   updateSliderPos(pos, w);
-
   let dragging = false;
-  slider.addEventListener('mousedown', () => dragging = true);
-  document.addEventListener('mouseup', () => dragging = false);
-  document.addEventListener('mousemove', e => {
+  const onMove = e => {
     if (!dragging) return;
     const rect = container.getBoundingClientRect();
-    pos = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    pos = Math.max(0, Math.min(clientX - rect.left, rect.width));
     updateSliderPos(pos, rect.width);
-  });
-  // Touch support
-  slider.addEventListener('touchstart', () => dragging = true);
-  document.addEventListener('touchend', () => dragging = false);
-  document.addEventListener('touchmove', e => {
-    if (!dragging) return;
-    const rect = container.getBoundingClientRect();
-    pos = Math.max(0, Math.min(e.touches[0].clientX - rect.left, rect.width));
-    updateSliderPos(pos, rect.width);
-  });
+  };
+  slider.onmousedown = slider.ontouchstart = () => dragging = true;
+  document.onmouseup = document.ontouchend = () => dragging = false;
+  document.onmousemove = onMove;
+  document.ontouchmove = onMove;
 }
 
 function updateSliderPos(pos, totalWidth) {
-  const slider = document.getElementById('slider');
-  const clipRight = document.getElementById('clipRight');
-  slider.style.left = pos + 'px';
-  clipRight.style.left = pos + 'px';
-  clipRight.style.width = (totalWidth - pos) + 'px';
+  document.getElementById('slider').style.left = pos + 'px';
+  const clip = document.getElementById('clipRight');
+  clip.style.left = pos + 'px';
+  clip.style.width = (totalWidth - pos) + 'px';
 }
 
-// Load original on start
+// Auto-load original on start
 window.addEventListener('load', () => {
   const img = document.getElementById('singleImg');
   img.onload = () => document.getElementById('loading').style.display = 'none';
   img.style.display = 'block';
-  img.src = '/api/original.png';
+  img.src = 'api/original.png';
+  // Auto-run segmentation with defaults
+  setTimeout(runSegmentation, 500);
 });
 </script>
 </body>

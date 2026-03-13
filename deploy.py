@@ -14,11 +14,20 @@ HYPHA_TOKEN = os.environ.get("HYPHA_TOKEN")
 
 async def serve_fastapi(args, context=None):
     """ASGI handler that forwards requests to the FastAPI app."""
-    scope = args["scope"]
+    scope = dict(args["scope"])
+    # Strip Hypha app prefix from path so FastAPI routes match
+    path = scope.get("path", "")
+    # The path comes as /ws-.../apps/daphnia-viewer/api/... — strip everything before the app routes
+    import re
+    m = re.search(r"/apps/[^/]+(/.*)", path)
+    if m:
+        scope["path"] = m.group(1)
+    elif not path.startswith("/api") and path != "/":
+        scope["path"] = "/"
     if context:
         user_id = context.get("user", {}).get("id", "unknown")
         print(f'{user_id} - {scope.get("client", "?")} - {scope.get("method", "?")} - {scope.get("path", "?")}')
-    await app(args["scope"], args["receive"], args["send"])
+    await app(scope, args["receive"], args["send"])
 
 
 async def main():
