@@ -1,0 +1,7 @@
+id: daphnia-deploy
+command: python3
+args: [deploy.py]
+workdir: /data/wei/workspace/bia-explore
+keepAlive: true
+env:
+  PYTHONUNBUFFERED: "1"

@@ -15,9 +15,14 @@ DATA_DIR = Path(__file__).parent
 RESULTS_DIR = DATA_DIR / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
-# Load image once at startup
-IMG_PATH = DATA_DIR / "data" / "20260210-DM-MPLX-MIX-24h_J21_w1.TIF"
-RAW_16 = np.array(Image.open(IMG_PATH))
+# Load all TIF images from data directory
+IMAGE_DIR = DATA_DIR / "data"
+IMAGES = {}
+for tif in sorted(IMAGE_DIR.glob("*.TIF")):
+    IMAGES[tif.stem] = np.array(Image.open(tif))
+# Default image key
+DEFAULT_IMAGE = list(IMAGES.keys())[0] if IMAGES else None
+RAW_16 = IMAGES[DEFAULT_IMAGE] if DEFAULT_IMAGE else None
 
 
 def to_uint8(arr):
@@ -55,17 +60,29 @@ def get_well_mask(img):
 
 
 def segment_body(img, well, body_ratio_thresh=0.85):
-    """Segment Daphnia body using local contrast ratio within the well."""
+    """Segment Daphnia body using local contrast ratio within the well.
+
+    Adaptive: if initial threshold yields a very small body (<2% of well),
+    gradually relax the threshold to handle low-contrast images.
+    """
     local_bg = gaussian_filter(img.astype(float), sigma=50)
     ratio = img.astype(float) / (local_bg + 1)
-    body_raw = (ratio < body_ratio_thresh) & well
-    body_raw = ndimage.binary_closing(body_raw, iterations=5)
-    body_raw = ndimage.binary_opening(body_raw, iterations=2)
-    # Keep largest connected component
-    lab, n = ndimage.label(body_raw)
-    if n > 0:
-        sz = [ndimage.sum(body_raw, lab, i) for i in range(1, n + 1)]
-        body_raw = lab == (np.argmax(sz) + 1)
+
+    # Try the given threshold first; adapt if body is too small
+    thresh = body_ratio_thresh
+    well_area = well.sum()
+    for _ in range(10):
+        body_raw = (ratio < thresh) & well
+        body_raw = ndimage.binary_closing(body_raw, iterations=5)
+        body_raw = ndimage.binary_opening(body_raw, iterations=2)
+        lab, n = ndimage.label(body_raw)
+        if n > 0:
+            sz = [ndimage.sum(body_raw, lab, i) for i in range(1, n + 1)]
+            body_raw = lab == (np.argmax(sz) + 1)
+        if body_raw.sum() > well_area * 0.02:
+            break
+        thresh += 0.02  # relax threshold for low contrast
+
     body = ndimage.binary_fill_holes(body_raw)
     body = ndimage.binary_closing(body, iterations=8)
     body = ndimage.binary_opening(body, iterations=3)
@@ -165,32 +182,46 @@ def create_overlay(img, body, eye, brain):
 cache = {}
 
 
-def run_segmentation(body_ratio=0.85, eye_pct=4, brain_pct=25):
-    key = (body_ratio, eye_pct, brain_pct)
+def run_segmentation(body_ratio=0.85, eye_pct=4, brain_pct=25, image_key=None):
+    if image_key is None:
+        image_key = DEFAULT_IMAGE
+    if image_key not in IMAGES:
+        raise ValueError(f"Unknown image: {image_key}")
+    img = IMAGES[image_key]
+    key = (image_key, body_ratio, eye_pct, brain_pct)
     if key in cache:
         return cache[key]
-    well = get_well_mask(RAW_16)
-    body = segment_body(RAW_16, well, body_ratio)
-    eye = segment_eye(RAW_16, body, eye_pct)
-    brain = segment_brain(RAW_16, body, eye, brain_pct)
-    overlay = create_overlay(RAW_16, body, eye, brain)
+    well = get_well_mask(img)
+    body = segment_body(img, well, body_ratio)
+    eye = segment_eye(img, body, eye_pct)
+    brain = segment_brain(img, body, eye, brain_pct)
+    overlay = create_overlay(img, body, eye, brain)
     result = {"body": body, "eye": eye, "brain": brain, "overlay": overlay, "well": well}
     cache[key] = result
     return result
 
 
+@app.get("/api/images")
+def list_images():
+    return {"images": list(IMAGES.keys()), "default": DEFAULT_IMAGE}
+
+
 @app.get("/api/original.png")
-def get_original():
-    return Response(content=arr_to_png_bytes(RAW_16), media_type="image/png")
+def get_original(image: str = Query(None)):
+    img_key = image or DEFAULT_IMAGE
+    if img_key not in IMAGES:
+        return Response(content=b"Not found", status_code=404)
+    return Response(content=arr_to_png_bytes(IMAGES[img_key]), media_type="image/png")
 
 
 @app.get("/api/segment.png")
 def get_segmentation(
     body_ratio: float = Query(0.85, ge=0.5, le=0.98),
     eye_pct: float = Query(4, ge=1, le=15),
-    brain_pct: float = Query(18, ge=3, le=40),
+    brain_pct: float = Query(25, ge=3, le=40),
+    image: str = Query(None),
 ):
-    result = run_segmentation(body_ratio, eye_pct, brain_pct)
+    result = run_segmentation(body_ratio, eye_pct, brain_pct, image)
     return Response(content=arr_to_png_bytes(result["overlay"]), media_type="image/png")
 
 
@@ -199,9 +230,10 @@ def get_mask(
     name: str,
     body_ratio: float = Query(0.85),
     eye_pct: float = Query(4),
-    brain_pct: float = Query(18),
+    brain_pct: float = Query(25),
+    image: str = Query(None),
 ):
-    result = run_segmentation(body_ratio, eye_pct, brain_pct)
+    result = run_segmentation(body_ratio, eye_pct, brain_pct, image)
     if name not in result:
         return Response(content=b"Not found", status_code=404)
     mask = result[name]
@@ -214,9 +246,11 @@ def get_mask(
 def get_stats(
     body_ratio: float = Query(0.85),
     eye_pct: float = Query(4),
-    brain_pct: float = Query(18),
+    brain_pct: float = Query(25),
+    image: str = Query(None),
 ):
-    result = run_segmentation(body_ratio, eye_pct, brain_pct)
+    result = run_segmentation(body_ratio, eye_pct, brain_pct, image)
+    img_key = image or DEFAULT_IMAGE
     return {
         "body_area_px": int(result["body"].sum()),
         "eye_area_px": int(result["eye"].sum()),
@@ -224,7 +258,7 @@ def get_stats(
         "eye_in_body": bool(np.all(result["eye"] <= result["body"])),
         "brain_in_body": bool(np.all(result["brain"] <= result["body"])),
         "eye_brain_overlap": int((result["eye"] & result["brain"]).sum()),
-        "image_shape": list(RAW_16.shape),
+        "image_shape": list(IMAGES[img_key].shape),
     }
 
 
@@ -239,44 +273,65 @@ def viewer():
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; }
-.header { background: #16213e; padding: 12px 24px; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid #0f3460; }
-.header h1 { font-size: 18px; color: #e94560; }
-.header .status { font-size: 13px; color: #888; margin-left: auto; }
-.main { display: flex; height: calc(100vh - 49px); }
-.sidebar { width: 320px; background: #16213e; padding: 16px; overflow-y: auto; border-right: 1px solid #0f3460; flex-shrink: 0; }
-.sidebar h3 { font-size: 13px; text-transform: uppercase; color: #e94560; margin-bottom: 10px; letter-spacing: 1px; }
-.control { margin-bottom: 16px; }
+.header { background: #16213e; padding: 10px 16px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #0f3460; }
+.header h1 { font-size: 16px; color: #e94560; white-space: nowrap; }
+.header .status { font-size: 12px; color: #888; margin-left: auto; white-space: nowrap; }
+.toggle-btn { display: none; background: #0f3460; border: none; color: #e94560; font-size: 20px; padding: 4px 10px; border-radius: 4px; cursor: pointer; }
+.main { display: flex; height: calc(100vh - 45px); }
+.sidebar { width: 300px; background: #16213e; padding: 14px; overflow-y: auto; border-right: 1px solid #0f3460; flex-shrink: 0; }
+.sidebar h3 { font-size: 12px; text-transform: uppercase; color: #e94560; margin-bottom: 8px; letter-spacing: 1px; }
+.control { margin-bottom: 14px; }
 .control label { display: block; font-size: 12px; color: #aaa; margin-bottom: 4px; }
-.control input[type=range] { width: 100%; accent-color: #e94560; }
+.control input[type=range] { width: 100%; accent-color: #e94560; height: 28px; }
 .control .value { font-size: 12px; color: #e94560; float: right; }
 .control .desc { font-size: 10px; color: #666; margin-top: 2px; clear: both; }
-.btn { background: #e94560; color: white; border: none; padding: 10px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; width: 100%; margin-bottom: 8px; transition: background 0.2s; }
+.btn { background: #e94560; color: white; border: none; padding: 10px 16px; border-radius: 4px; cursor: pointer; font-size: 14px; width: 100%; margin-bottom: 8px; transition: background 0.2s; -webkit-tap-highlight-color: transparent; }
 .btn:hover { background: #c73652; }
+.btn:active { background: #b02e48; }
 .btn.secondary { background: #0f3460; }
 .btn.secondary:hover { background: #1a4a8a; }
-.stats { background: #0f3460; border-radius: 6px; padding: 12px; margin-top: 12px; font-size: 12px; }
-.stats .row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+.mask-btns { display: flex; gap: 6px; }
+.mask-btns .btn { flex: 1; padding: 8px 4px; font-size: 12px; }
+.stats { background: #0f3460; border-radius: 6px; padding: 10px; margin-top: 10px; font-size: 12px; }
+.stats .row { display: flex; justify-content: space-between; margin-bottom: 3px; }
 .stats .label { color: #888; }
 .stats .ok { color: #4caf50; }
 .stats .bad { color: #f44336; }
 .viewer { flex: 1; position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; background: #111; }
-.compare-container { position: relative; display: inline-block; user-select: none; }
-.compare-container img { display: block; max-width: 100%; max-height: calc(100vh - 49px); }
-.compare-slider { position: absolute; top: 0; bottom: 0; width: 3px; background: #e94560; cursor: ew-resize; z-index: 10; }
-.compare-slider::after { content: '\\2194'; position: absolute; top: 50%; left: -12px; width: 27px; height: 27px; background: #e94560; border-radius: 50%; transform: translateY(-50%); display: flex; align-items: center; justify-content: center; font-size: 14px; color: white; line-height: 27px; text-align: center; }
-.compare-right { position: absolute; top: 0; right: 0; bottom: 0; overflow: hidden; }
-.compare-right img { position: absolute; top: 0; right: 0; max-height: calc(100vh - 49px); }
-.legend { position: absolute; bottom: 16px; right: 16px; background: rgba(22,33,62,0.9); padding: 10px 14px; border-radius: 6px; font-size: 12px; }
-.legend div { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-.legend .dot { width: 12px; height: 12px; border-radius: 50%; }
-.mode-tabs { display: flex; gap: 4px; margin-bottom: 16px; }
-.mode-tab { flex: 1; padding: 6px; text-align: center; background: #0f3460; border: none; color: #aaa; cursor: pointer; font-size: 12px; border-radius: 4px; }
+.compare-container { position: relative; display: inline-block; user-select: none; touch-action: none; }
+.compare-container img { display: block; max-width: 100%; max-height: calc(100vh - 45px); }
+.compare-slider { position: absolute; top: 0; bottom: 0; width: 3px; background: #e94560; cursor: ew-resize; z-index: 10; touch-action: none; }
+.compare-slider::after { content: '\\2194'; position: absolute; top: 50%; left: -14px; width: 31px; height: 31px; background: #e94560; border-radius: 50%; transform: translateY(-50%); display: flex; align-items: center; justify-content: center; font-size: 16px; color: white; line-height: 31px; text-align: center; }
+.legend { position: absolute; bottom: 12px; right: 12px; background: rgba(22,33,62,0.9); padding: 8px 12px; border-radius: 6px; font-size: 11px; }
+.legend div { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+.legend .dot { width: 10px; height: 10px; border-radius: 50%; }
+.mode-tabs { display: flex; gap: 4px; margin-bottom: 14px; }
+.mode-tab { flex: 1; padding: 7px 4px; text-align: center; background: #0f3460; border: none; color: #aaa; cursor: pointer; font-size: 12px; border-radius: 4px; -webkit-tap-highlight-color: transparent; }
 .mode-tab.active { background: #e94560; color: white; }
 .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #e94560; font-size: 14px; }
+
+/* Mobile: stack vertically, collapsible sidebar */
+@media (max-width: 768px) {
+  .toggle-btn { display: block; }
+  .main { flex-direction: column; height: auto; min-height: calc(100vh - 45px); }
+  .sidebar { width: 100%; max-height: 50vh; border-right: none; border-bottom: 1px solid #0f3460; padding: 12px; }
+  .sidebar.collapsed { display: none; }
+  .viewer { min-height: 50vh; height: 50vh; }
+  .viewer img, .compare-container img, .compare-right img { max-height: 50vh !important; }
+  #singleImg { max-height: 50vh !important; }
+  .legend { bottom: 8px; right: 8px; font-size: 10px; padding: 6px 8px; }
+}
+@media (max-width: 480px) {
+  .header h1 { font-size: 14px; }
+  .sidebar { padding: 10px; }
+  .btn { padding: 10px 12px; font-size: 13px; }
+  .control input[type=range] { height: 32px; }
+}
 </style>
 </head>
 <body>
 <div class="header">
+  <button class="toggle-btn" id="toggleSidebar" onclick="toggleSidebar()">&#9776;</button>
   <h1>Daphnia Segmentation</h1>
   <span class="status" id="statusText">Ready</span>
 </div>
@@ -287,6 +342,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       <button class="mode-tab" onclick="setMode('original')" id="tab-original">Original</button>
       <button class="mode-tab active" onclick="setMode('overlay')" id="tab-overlay">Overlay</button>
       <button class="mode-tab" onclick="setMode('compare')" id="tab-compare">Compare</button>
+    </div>
+
+    <h3>Image</h3>
+    <div class="control">
+      <select id="image-select" style="width:100%;padding:6px;background:#0f3460;color:#e0e0e0;border:1px solid #1a4a8a;border-radius:4px;font-size:12px;">
+      </select>
     </div>
 
     <h3>Segmentation Parameters</h3>
@@ -309,10 +370,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     <button class="btn" onclick="runSegmentation()">Run Segmentation</button>
     <button class="btn secondary" onclick="resetParams()">Reset Defaults</button>
 
-    <h3 style="margin-top:16px">Individual Masks</h3>
-    <button class="btn secondary" onclick="showMask('body')">Body Mask</button>
-    <button class="btn secondary" onclick="showMask('eye')">Eye Mask</button>
-    <button class="btn secondary" onclick="showMask('brain')">Brain Mask</button>
+    <h3 style="margin-top:12px">Individual Masks</h3>
+    <div class="mask-btns">
+      <button class="btn secondary" onclick="showMask('body')">Body</button>
+      <button class="btn secondary" onclick="showMask('eye')">Eye</button>
+      <button class="btn secondary" onclick="showMask('brain')">Brain</button>
+    </div>
 
     <div class="stats" id="stats">
       <div class="row"><span class="label">Click "Run Segmentation" to start</span></div>
@@ -322,10 +385,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   <div class="viewer" id="viewer">
     <div class="compare-container" id="compareContainer" style="display:none;">
       <img id="imgLeft" src="" draggable="false">
+      <img id="imgRight" src="" draggable="false" style="position:absolute;top:0;left:0;width:100%;height:100%;">
       <div class="compare-slider" id="slider"></div>
-      <div class="compare-right" id="clipRight">
-        <img id="imgRight" src="" draggable="false">
-      </div>
     </div>
     <img id="singleImg" src="" style="max-width:100%;max-height:calc(100vh - 49px);display:none;" draggable="false">
     <div class="loading" id="loading">Loading image...</div>
@@ -341,6 +402,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 const BASE = '';
 let mode = 'overlay';
 let overlayUrl = null;
+let currentImage = null;
+
+function toggleSidebar() {
+  const sb = document.querySelector('.sidebar');
+  sb.classList.toggle('collapsed');
+}
 
 function getParams() {
   return {
@@ -352,7 +419,9 @@ function getParams() {
 
 function paramString() {
   const p = getParams();
-  return `body_ratio=${p.body_ratio}&eye_pct=${p.eye_pct}&brain_pct=${p.brain_pct}`;
+  let ps = `body_ratio=${p.body_ratio}&eye_pct=${p.eye_pct}&brain_pct=${p.brain_pct}`;
+  if (currentImage) ps += `&image=${encodeURIComponent(currentImage)}`;
+  return ps;
 }
 
 ['body','eye','brain'].forEach(name => {
@@ -384,7 +453,7 @@ function render() {
 
   if (mode === 'original') {
     single.style.display = 'block';
-    single.src = 'api/original.png';
+    single.src = 'api/original.png?' + (currentImage ? `image=${encodeURIComponent(currentImage)}` : '');
     loading.style.display = 'none';
   } else if (mode === 'overlay' && overlayUrl) {
     single.style.display = 'block';
@@ -395,7 +464,7 @@ function render() {
     compare.style.display = 'block';
     const leftImg = document.getElementById('imgLeft');
     const rightImg = document.getElementById('imgRight');
-    leftImg.src = 'api/original.png';
+    leftImg.src = 'api/original.png?' + (currentImage ? `image=${encodeURIComponent(currentImage)}` : '');
     rightImg.src = overlayUrl;
     legend.style.display = 'block';
     loading.style.display = 'none';
@@ -460,19 +529,19 @@ function resetParams() {
 function initSlider() {
   const container = document.getElementById('compareContainer');
   const slider = document.getElementById('slider');
-  const clipRight = document.getElementById('clipRight');
   const w = container.offsetWidth;
   let pos = w / 2;
   updateSliderPos(pos, w);
   let dragging = false;
   const onMove = e => {
     if (!dragging) return;
+    e.preventDefault();
     const rect = container.getBoundingClientRect();
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     pos = Math.max(0, Math.min(clientX - rect.left, rect.width));
     updateSliderPos(pos, rect.width);
   };
-  slider.onmousedown = slider.ontouchstart = () => dragging = true;
+  slider.onmousedown = slider.ontouchstart = (e) => { dragging = true; e.preventDefault(); };
   document.onmouseup = document.ontouchend = () => dragging = false;
   document.onmousemove = onMove;
   document.ontouchmove = onMove;
@@ -480,18 +549,35 @@ function initSlider() {
 
 function updateSliderPos(pos, totalWidth) {
   document.getElementById('slider').style.left = pos + 'px';
-  const clip = document.getElementById('clipRight');
-  clip.style.left = pos + 'px';
-  clip.style.width = (totalWidth - pos) + 'px';
+  // Clip the overlay (right) image: show only from slider position to the right
+  const pct = (pos / totalWidth) * 100;
+  document.getElementById('imgRight').style.clipPath = `inset(0 0 0 ${pct}%)`;
 }
 
-// Auto-load original on start
-window.addEventListener('load', () => {
+// Load image list and auto-run
+window.addEventListener('load', async () => {
+  try {
+    const resp = await fetch('api/images');
+    const data = await resp.json();
+    const sel = document.getElementById('image-select');
+    data.images.forEach(name => {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      if (name === data.default) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    currentImage = data.default;
+    sel.addEventListener('change', () => {
+      currentImage = sel.value;
+      overlayUrl = null;
+      render();
+    });
+  } catch(e) { console.error('Failed to load images:', e); }
   const img = document.getElementById('singleImg');
   img.onload = () => document.getElementById('loading').style.display = 'none';
   img.style.display = 'block';
   img.src = 'api/original.png';
-  // Auto-run segmentation with defaults
   setTimeout(runSegmentation, 500);
 });
 </script>
