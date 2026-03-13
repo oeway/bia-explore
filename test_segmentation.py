@@ -31,7 +31,7 @@ t0 = time.time()
 well = get_well_mask(RAW_16)
 body = segment_body(RAW_16, well, 0.85)
 eye = segment_eye(RAW_16, body, 4)
-brain = segment_brain(RAW_16, body, eye, 18)
+brain = segment_brain(RAW_16, body, eye, 25)
 overlay = create_overlay(RAW_16, body, eye, brain)
 elapsed = time.time() - t0
 

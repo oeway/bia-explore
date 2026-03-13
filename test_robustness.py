@@ -33,7 +33,7 @@ for img_path in image_files:
         well = get_well_mask(img)
         body = segment_body(img, well, 0.85)
         eye = segment_eye(img, body, 4)
-        brain = segment_brain(img, body, eye, 18)
+        brain = segment_brain(img, body, eye, 25)
         elapsed = time.time() - t0
     except Exception as e:
         print(f"  ERROR: {e}")

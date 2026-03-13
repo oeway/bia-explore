@@ -115,7 +115,7 @@ def segment_eye(img, body, eye_pct=4):
     return eye & body
 
 
-def segment_brain(img, body, eye, brain_pct=18):
+def segment_brain(img, body, eye, brain_pct=25):
     """Segment the brain — darker region near the eye in the head."""
     eye_coords = np.argwhere(eye)
     if len(eye_coords) == 0:
@@ -165,7 +165,7 @@ def create_overlay(img, body, eye, brain):
 cache = {}
 
 
-def run_segmentation(body_ratio=0.85, eye_pct=4, brain_pct=18):
+def run_segmentation(body_ratio=0.85, eye_pct=4, brain_pct=25):
     key = (body_ratio, eye_pct, brain_pct)
     if key in cache:
         return cache[key]
@@ -301,8 +301,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       <div class="desc">Lower = stricter (only darkest pixels as eye)</div>
     </div>
     <div class="control">
-      <label>Brain intensity percentile <span class="value" id="val-brain">18</span></label>
-      <input type="range" id="param-brain" min="3" max="40" value="18" step="1">
+      <label>Brain intensity percentile <span class="value" id="val-brain">25</span></label>
+      <input type="range" id="param-brain" min="3" max="40" value="25" step="1">
       <div class="desc">Higher = larger brain region</div>
     </div>
 
@@ -451,10 +451,10 @@ function updateStats(data) {
 function resetParams() {
   document.getElementById('param-body').value = 0.85;
   document.getElementById('param-eye').value = 4;
-  document.getElementById('param-brain').value = 18;
+  document.getElementById('param-brain').value = 25;
   document.getElementById('val-body').textContent = '0.85';
   document.getElementById('val-eye').textContent = '4';
-  document.getElementById('val-brain').textContent = '18';
+  document.getElementById('val-brain').textContent = '25';
 }
 
 function initSlider() {
