@@ -1,0 +1,18 @@
+name: bia-explore
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - matplotlib
+  - pillow
+  - scikit-image
+  - opencv
+  - pip
+  - pip:
+    - fastapi
+    - uvicorn
+    - hypha-rpc
+    - cellpose

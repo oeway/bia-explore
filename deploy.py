@@ -8,7 +8,7 @@ from hypha_rpc import connect_to_server
 from server import app
 
 HYPHA_SERVER_URL = os.environ.get("HYPHA_SERVER_URL", "https://hypha.aicell.io")
-HYPHA_WORKSPACE = os.environ.get("HYPHA_WORKSPACE", "")
+HYPHA_WORKSPACE = ""  # Use anonymous workspace; set explicitly if needed
 HYPHA_TOKEN = os.environ.get("HYPHA_TOKEN")
 
 
